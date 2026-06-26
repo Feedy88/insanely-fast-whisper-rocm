@@ -355,6 +355,11 @@ FILENAME_TIMEZONE = APP_TIMEZONE  # Backwards-compatible alias
 CONFIG_DIR = USER_CONFIG_DIR
 ENV_FILE = USER_ENV_FILE
 
+# Wyoming protocol configuration
+WYOMING_HOST = os.getenv("WYOMING_HOST", "0.0.0.0")
+WYOMING_PORT = int(os.getenv("WYOMING_PORT", "10300"))
+WYOMING_LANGUAGE = os.getenv("WYOMING_LANGUAGE", "de")
+
 # Logging configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # Logging level
 
