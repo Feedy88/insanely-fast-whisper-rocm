@@ -27,6 +27,25 @@ def test_validate_audio_file__valid_format() -> None:
     validate_audio_file(file)
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "recording.webm",
+        "recording.ogg",
+        "recording.opus",
+        "recording.weba",
+        "recording.aac",
+        "recording.WEBM",  # case-insensitive
+    ],
+)
+def test_validate_audio_file__browser_formats_accepted(filename: str) -> None:
+    """Accept browser/streaming recording formats (converted via FFmpeg)."""
+    file = MagicMock(spec=UploadFile)
+    file.filename = filename
+    # Should not raise
+    validate_audio_file(file)
+
+
 def test_validate_audio_file__invalid_format__raises_http_exception() -> None:
     """Raise HTTPException for invalid audio format."""
     file = MagicMock(spec=UploadFile)

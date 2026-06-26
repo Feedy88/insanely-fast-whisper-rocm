@@ -402,12 +402,38 @@ SUPPORTED_RESPONSE_FORMATS = {
     RESPONSE_FORMAT_VTT,
 }
 
-# Supported audio formats (lowercase extensions)
+# Supported audio formats (lowercase extensions).
+#
+# Any non-WAV input is transparently transcoded to 16 kHz mono WAV via FFmpeg
+# (see ``audio.conversion.ensure_wav``) before transcription, so this list can
+# safely include every container/codec FFmpeg can decode. It exists only to
+# reject obviously non-audio uploads early with a clear error message.
 SUPPORTED_AUDIO_FORMATS: set[str] = {
     ".mp3",
     ".flac",
     ".wav",
     ".m4a",
+    # Browser / streaming recordings (e.g. OpenWhispr, MediaRecorder API)
+    ".webm",
+    ".weba",
+    ".ogg",
+    ".oga",
+    ".opus",
+    # Other common audio containers / codecs
+    ".aac",
+    ".wma",
+    ".aiff",
+    ".aif",
+    ".aifc",
+    ".amr",
+    ".mka",
+    ".caf",
+    ".ac3",
+    ".au",
+    ".3gp",
+    ".3gpp",
+    ".wv",
+    ".ape",
 }
 
 # Supported video formats (lowercase extensions)
