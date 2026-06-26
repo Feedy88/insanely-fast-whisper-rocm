@@ -16,7 +16,73 @@ from insanely_fast_whisper_rocm.core.asr_backend import (
     HuggingFaceBackend,
     HuggingFaceBackendConfig,
 )
-from insanely_fast_whisper_rocm.core.errors import TranscriptionError
+from insanely_fast_whisper_rocm.core.errors import (
+    GpuContextLostError,
+    TranscriptionError,
+)
+
+
+@pytest.mark.parametrize(
+    "hip_message",
+    [
+        "HIP error: unspecified launch failure",
+        "RuntimeError: unspecified launch failure",
+    ],
+)
+def test_hip_error_during_inference__raises_gpu_context_lost(
+    tmp_path: pathlib.Path,
+    hip_message: str,
+) -> None:
+    """A HIP/launch-failure RuntimeError surfaces as GpuContextLostError.
+
+    This must NOT be swallowed or downgraded to a generic TranscriptionError,
+    so a supervised caller can restart the process with a clean context.
+    """
+    config = HuggingFaceBackendConfig(
+        model_name="openai/whisper-tiny",
+        device="cpu",
+        dtype="float32",
+        batch_size=1,
+        chunk_length=30,
+        progress_group_size=4,
+    )
+    backend = HuggingFaceBackend(config)
+
+    class DummyModel:
+        generation_config = types.SimpleNamespace(no_timestamps_token_id=50363)
+        config = types.SimpleNamespace(lang_to_id=None, task_to_id=None)
+
+    class DummyPipe:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+        def __call__(self, path: str, **kwargs: dict[str, Any]) -> dict[str, Any]:
+            """Raise a HIP launch-failure RuntimeError.
+
+            Args:
+                path: Audio file path.
+                **kwargs: Pipeline keyword arguments.
+
+            Raises:
+                RuntimeError: Always, simulating a poisoned HIP context.
+            """
+            raise RuntimeError(hip_message)
+
+    backend.asr_pipe = DummyPipe()
+
+    audio_file = tmp_path / "audio.wav"
+    audio_file.write_bytes(b"0")
+
+    with pytest.raises(GpuContextLostError, match="GPU context lost"):
+        backend.process_audio(
+            str(audio_file),
+            language=None,
+            task="transcribe",
+            return_timestamps_value=False,
+        )
+
+    # The pipeline reference is dropped after a context-lost error.
+    assert backend.asr_pipe is None
 
 
 def test_runtime_error_tensor_mismatch_falls_back_to_chunk_timestamps(

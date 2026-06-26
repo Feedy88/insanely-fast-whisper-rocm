@@ -36,6 +36,16 @@ class InferenceOOMError(OutOfMemoryError):
     """Raised when audio processing fails due to OOM."""
 
 
+class GpuContextLostError(TranscriptionError):
+    """Raised when the GPU/HIP context is irrecoverably lost during inference.
+
+    On ROCm a "HIP error: unspecified launch failure" poisons the device context
+    for the entire process; no in-process recovery is possible (even
+    ``torch.cuda.synchronize()`` keeps failing). A supervised service should exit
+    on this error so the process is restarted with a clean context.
+    """
+
+
 class TranscriptionCancelledError(TranscriptionError):
     """Raised when transcription is cancelled by the caller."""
 

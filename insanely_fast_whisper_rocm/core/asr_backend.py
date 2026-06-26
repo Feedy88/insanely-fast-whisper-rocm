@@ -27,6 +27,7 @@ from transformers.utils import logging as hf_logging
 from insanely_fast_whisper_rocm.core.cancellation import CancellationToken
 from insanely_fast_whisper_rocm.core.errors import (
     DeviceNotFoundError,
+    GpuContextLostError,
     InferenceOOMError,
     ModelLoadingOOMError,
     TranscriptionError,
@@ -550,19 +551,21 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
                             "chunk_length": self.config.chunk_length,
                         },
                     ) from e
-                if "hip error" in str(e).lower():
-                    logger.warning(
-                        "HIP error during inference; resetting pipeline so next "
-                        "request reinitialises on a clean GPU context: %s",
+                msg = str(e).lower()
+                if "hip error" in msg or "unspecified launch failure" in msg:
+                    # The HIP context is poisoned process-wide; it cannot be
+                    # recovered in place (empty_cache/synchronize keep failing).
+                    # Drop the pipeline and surface a typed error so a supervised
+                    # caller can restart the process with a clean context.
+                    self.asr_pipe = None
+                    logger.critical(
+                        "Unrecoverable GPU error during inference; the HIP context "
+                        "is lost process-wide: %s",
                         str(e),
                     )
-                    self.asr_pipe = None
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        gc.collect()
-                    except Exception:  # pylint: disable=broad-except
-                        pass
+                    raise GpuContextLostError(
+                        f"GPU context lost during inference: {str(e)}"
+                    ) from e
                 raise
         except RuntimeError as e:
             # Check if this is the specific tensor size mismatch error in

@@ -374,6 +374,14 @@ WYOMING_HOST = os.getenv("WYOMING_HOST", "0.0.0.0")
 WYOMING_PORT = int(os.getenv("WYOMING_PORT", "10300"))
 WYOMING_LANGUAGE = os.getenv("WYOMING_LANGUAGE", "de")
 
+# When the GPU/HIP context is irrecoverably lost mid-inference, exit the Wyoming
+# process so a supervisor (systemd Restart=on-failure / Docker restart policy)
+# brings it back up with a clean context. Disable only if you run the server
+# without a supervisor and prefer it to stay up returning empty transcripts.
+WYOMING_EXIT_ON_GPU_ERROR = (
+    os.getenv("WYOMING_EXIT_ON_GPU_ERROR", "true").lower() == "true"
+)
+
 # Logging configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # Logging level
 

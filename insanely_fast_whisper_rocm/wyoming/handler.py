@@ -9,6 +9,7 @@ returns a Transcript event.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -22,6 +23,7 @@ from wyoming.info import Describe, Info
 from wyoming.server import AsyncEventHandler
 
 from insanely_fast_whisper_rocm.core.asr_backend import HuggingFaceBackendConfig
+from insanely_fast_whisper_rocm.core.errors import GpuContextLostError
 from insanely_fast_whisper_rocm.core.orchestrator import TranscriptionOrchestrator
 from insanely_fast_whisper_rocm.utils.constants import (
     DEFAULT_BATCH_SIZE,
@@ -30,6 +32,7 @@ from insanely_fast_whisper_rocm.utils.constants import (
     DEFAULT_DTYPE,
     DEFAULT_MODEL,
     DEFAULT_PROGRESS_GROUP_SIZE,
+    WYOMING_EXIT_ON_GPU_ERROR,
     WYOMING_LANGUAGE,
 )
 
@@ -38,6 +41,10 @@ logger = logging.getLogger(__name__)
 _TARGET_RATE = 16000
 _TARGET_WIDTH = 2  # 16-bit
 _TARGET_CHANNELS = 1  # mono
+
+# Non-zero exit code used when bailing out on an unrecoverable GPU error, so the
+# service supervisor treats it as a failure and restarts the process.
+_GPU_LOST_EXIT_CODE = 75
 
 
 class WyomingEventHandler(AsyncEventHandler):
@@ -108,12 +115,45 @@ class WyomingEventHandler(AsyncEventHandler):
             self._audio_buffer.append(normalised.audio)
 
         elif AudioStop.is_type(event.type):
-            text = await asyncio.to_thread(self._transcribe_buffered_audio)
+            try:
+                text = await asyncio.to_thread(self._transcribe_buffered_audio)
+            except GpuContextLostError:
+                await self._handle_gpu_context_lost()
+                return False
             logger.info("Transcription result: %r", text)
             await self.write_event(Transcript(text=text).event())
             return False  # close this connection after sending transcript
 
         return True
+
+    async def _handle_gpu_context_lost(self) -> None:
+        """Respond to an unrecoverable GPU error and restart the process.
+
+        The HIP/GPU context is poisoned for the whole process, so no further
+        request can succeed. Send an empty transcript so the client does not
+        hang, then exit (unless disabled) so the supervisor restarts us with a
+        clean context.
+        """
+        logger.critical(
+            "GPU context lost (unrecoverable HIP error). Sending empty transcript "
+            "and exiting so the service restarts with a clean GPU context."
+        )
+        # Best-effort empty response; the connection/context may already be gone.
+        with contextlib.suppress(Exception):
+            await self.write_event(Transcript(text="").event())
+
+        if not WYOMING_EXIT_ON_GPU_ERROR:
+            logger.warning(
+                "WYOMING_EXIT_ON_GPU_ERROR is disabled; staying up, but further "
+                "transcriptions will keep failing until the process is restarted."
+            )
+            return
+
+        # os._exit bypasses asyncio/atexit teardown on purpose: the context is
+        # dead and we want an immediate, guaranteed process exit for the
+        # supervisor to restart. The temp WAV is already cleaned up in the
+        # worker's finally block before this error propagated.
+        os._exit(_GPU_LOST_EXIT_CODE)
 
     def _transcribe_buffered_audio(self) -> str:
         """Write buffered PCM to a temp WAV, run Whisper, return text.
@@ -154,6 +194,11 @@ class WyomingEventHandler(AsyncEventHandler):
                 save_transcriptions=False,
             )
             return result.get("text", "")
+
+        except GpuContextLostError:
+            # Unrecoverable: let it propagate so handle_event can restart the
+            # process instead of silently returning an empty transcript forever.
+            raise
 
         except Exception:
             logger.exception("Transcription failed in Wyoming handler")
