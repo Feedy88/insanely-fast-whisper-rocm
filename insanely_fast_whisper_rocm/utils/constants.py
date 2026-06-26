@@ -107,10 +107,12 @@ __all__ = [
 # --- Logging Setup ---
 logger = logging.getLogger(__name__)
 
-# --- Load user-specific .env (overrides project .env) ---
+# --- Load user-specific .env (provides defaults, does not override shell vars) ---
+# env_loader.py already loaded both files; this is kept for modules that import
+# constants directly without going through env_loader first.
 if USER_ENV_EXISTS:
     debug_print(f"Loading user .env: {USER_ENV_FILE}")
-    load_dotenv(USER_ENV_FILE, override=True)
+    load_dotenv(USER_ENV_FILE, override=False)
 
 # --- Log final environment state ---
 debug_print(

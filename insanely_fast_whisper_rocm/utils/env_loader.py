@@ -6,6 +6,18 @@ This module is responsible for:
 - Providing utility functions and constants for conditional debug printing.
 - Exposing paths and existence flags for .env files to be used by constants.py
   for the main .env loading sequence.
+
+Environment variable precedence (highest → lowest):
+  1. Shell environment variables  (e.g. ``WHISPER_MODEL=… python -m …``)
+  2. User config  (~/.config/insanely-fast-whisper-rocm/.env)
+  3. Project .env  (repo root .env — acts as default/template only)
+
+All .env files are loaded with ``override=False`` so that values already present
+in the process environment are never replaced.  To override the model at runtime,
+pass the variable before the command::
+
+    WHISPER_MODEL=openai/whisper-small insanely-fast-whisper-wyoming
+    WHISPER_MODEL=openai/whisper-small insanely-fast-whisper-rocm
 """
 
 import logging
@@ -29,20 +41,23 @@ USER_ENV_FILE = USER_CONFIG_DIR / ".env"
 _cli_debug_mode = "--debug" in sys.argv
 
 # Temporarily load .env files to check LOG_LEVEL for initial debug print decision.
-# This is a pre-load specifically for determining SHOW_DEBUG_PRINTS.
-# The main loading in constants.py will handle the final override logic.
+# override=False: shell env vars already set in the process take precedence.
+# Load order: project first (defaults), then user config (can override project
+# defaults but not shell vars because both use override=False and the user .env
+# is loaded second — values already set by the project load won't be replaced,
+# so we load user first in the pre-check to mirror constants.py load order).
 
 _project_root_env_exists_temp = PROJECT_ROOT_ENV_FILE.exists()
-if _project_root_env_exists_temp:
-    load_dotenv(PROJECT_ROOT_ENV_FILE, override=True)
-
 if not USER_CONFIG_DIR.exists():
     USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 _user_env_exists_temp = USER_ENV_FILE.exists()
+
+# Pre-load: user config first so it wins over project defaults (both override=False,
+# so shell vars win over both).
 if _user_env_exists_temp:
-    load_dotenv(
-        USER_ENV_FILE, override=True
-    )  # User .env can override project for LOG_LEVEL check
+    load_dotenv(USER_ENV_FILE, override=False)
+if _project_root_env_exists_temp:
+    load_dotenv(PROJECT_ROOT_ENV_FILE, override=False)
 
 _env_log_level_temp = os.getenv("LOG_LEVEL", "").upper()
 _env_debug_mode_temp = _env_log_level_temp == "DEBUG"
@@ -75,12 +90,15 @@ def debug_print(message: str) -> None:
         logger.debug(message)
 
 
-# Perform the actual loading of the project root .env file here
+# Main load: same order as the pre-load above (user first, project second).
+# override=False ensures shell env vars set before process start are never
+# replaced.  The project .env provides fallback defaults only.
+if _user_env_exists_temp:
+    debug_print(f"Loading user .env: {USER_ENV_FILE}")
+    load_dotenv(USER_ENV_FILE, override=False)
 if _project_root_env_exists_temp:
     debug_print(f"Loading project .env: {PROJECT_ROOT_ENV_FILE}")
-    load_dotenv(
-        PROJECT_ROOT_ENV_FILE, override=True
-    )  # This is the main load for project root .env
+    load_dotenv(PROJECT_ROOT_ENV_FILE, override=False)
 else:
     debug_print(f"No project .env found at: {PROJECT_ROOT_ENV_FILE}")
 
