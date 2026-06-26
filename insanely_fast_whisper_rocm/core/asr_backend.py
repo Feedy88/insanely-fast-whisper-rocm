@@ -34,9 +34,19 @@ from insanely_fast_whisper_rocm.core.errors import (
 from insanely_fast_whisper_rocm.core.oom_utils import classify_oom_error
 from insanely_fast_whisper_rocm.core.progress import NoOpProgress, ProgressCallback
 from insanely_fast_whisper_rocm.core.utils import convert_device_string
+from insanely_fast_whisper_rocm.utils.constants import DEFAULT_ATTN_IMPLEMENTATION
 
 # Placeholder for logger, will be configured properly later
 logger = logging.getLogger(__name__)
+
+# Map the configured dtype string to the corresponding torch dtype. Unknown
+# values fall back to float32. bfloat16 must be listed explicitly: on ROCm it is
+# a stable alternative to float16 for the SDPA flash path.
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 @dataclass
@@ -137,24 +147,38 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
             )
 
             model_load_kwargs = {
-                "dtype": (
-                    torch.float16 if self.config.dtype == "float16" else torch.float32
-                ),
+                "dtype": _DTYPE_MAP.get(self.config.dtype, torch.float32),
                 "use_safetensors": True,
             }
 
-            # For newer transformers, SDPA is fast. On ROCm it sometimes fails at
-            # runtime on certain stacks; per user preference, try SDPA first and
-            # fallback to 'eager' only if needed. Keep SDPA on CUDA.
+            # Choose the attention implementation. SDPA is fastest on CUDA, but on
+            # ROCm the AOTriton flash/mem-efficient SDPA kernels for float16 crash
+            # the HIP context on gfx1103 (see DEFAULT_ATTN_IMPLEMENTATION). Default
+            # to 'eager' on ROCm, 'sdpa' elsewhere; allow an explicit override.
             if self.effective_device != "cpu":
                 is_rocm = getattr(torch.version, "hip", None) is not None
-                if is_rocm:
-                    model_load_kwargs["attn_implementation"] = "sdpa"
-                    logger.info(
-                        "ROCm detected; trying attn_implementation='sdpa' first"
-                    )
+                configured = (DEFAULT_ATTN_IMPLEMENTATION or "").strip().lower()
+                if configured:
+                    attn_impl = configured
+                elif is_rocm:
+                    attn_impl = "eager"
                 else:
-                    model_load_kwargs["attn_implementation"] = "sdpa"
+                    attn_impl = "sdpa"
+                model_load_kwargs["attn_implementation"] = attn_impl
+
+                if is_rocm and attn_impl == "sdpa" and self.config.dtype == "float16":
+                    logger.warning(
+                        "attn_implementation='sdpa' with float16 on ROCm is known to "
+                        "trigger 'HIP error: unspecified launch failure' on gfx1103 "
+                        "and poison the GPU context. Prefer "
+                        "WHISPER_ATTN_IMPLEMENTATION=eager or WHISPER_DTYPE=bfloat16."
+                    )
+                logger.info(
+                    "Attention implementation: %s (rocm=%s, dtype=%s)",
+                    attn_impl,
+                    is_rocm,
+                    self.config.dtype,
+                )
 
             try:
                 logger.info(

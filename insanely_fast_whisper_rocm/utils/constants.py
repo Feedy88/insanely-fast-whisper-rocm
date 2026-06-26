@@ -143,6 +143,18 @@ DEFAULT_TIMESTAMP_TYPE: Literal["chunk", "word"] = _TIMESTAMP_TYPE_ENV
 
 DEFAULT_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "None")  # None means auto-detect
 DEFAULT_DTYPE = os.getenv("WHISPER_DTYPE", "float16")  # Data type for model inference
+
+# Attention implementation passed to Transformers when loading the model.
+# Empty string means "auto": on ROCm/HIP the default is "eager", elsewhere "sdpa".
+#
+# Why eager is the ROCm default: on the AMD 780M (gfx1103) spoofed as gfx1100 via
+# HSA_OVERRIDE_GFX_VERSION, the AOTriton flash / memory-efficient SDPA kernels for
+# float16 trigger an intermittent "HIP error: unspecified launch failure" that
+# poisons the GPU context for the entire process (no in-process recovery is
+# possible). "eager" avoids torch SDPA entirely and is stable under sustained
+# load. Set to "sdpa" explicitly (ideally with WHISPER_DTYPE=bfloat16) if you
+# want maximum throughput and your stack proves stable.
+DEFAULT_ATTN_IMPLEMENTATION = os.getenv("WHISPER_ATTN_IMPLEMENTATION", "")
 DEFAULT_BETTER_TRANSFORMER = (
     os.getenv("WHISPER_BETTER_TRANSFORMER", "false").lower() == "true"
 )  # Use BetterTransformer

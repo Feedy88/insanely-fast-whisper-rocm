@@ -163,6 +163,48 @@ def test_initialize_pipeline_loads_model_with_float32(
     assert call_kwargs["dtype"] == torch.float32
 
 
+def test_initialize_pipeline_loads_model_with_bfloat16(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verify bfloat16 maps to torch.bfloat16 (stable SDPA path on ROCm)."""
+    config = HuggingFaceBackendConfig(
+        model_name="openai/whisper-tiny",
+        device="cpu",
+        dtype="bfloat16",
+        batch_size=4,
+        chunk_length=30,
+        progress_group_size=4,
+    )
+    backend = HuggingFaceBackend(config)
+
+    mock_model = MagicMock()
+    mock_model.generation_config = types.SimpleNamespace(
+        no_timestamps_token_id=50363,
+    )
+    mock_model.config = types.SimpleNamespace(lang_to_id=None, task_to_id=None)
+
+    with patch(
+        "insanely_fast_whisper_rocm.core.asr_backend.AutoModelForSpeechSeq2Seq.from_pretrained",
+        return_value=mock_model,
+    ) as mock_model_load:
+        with patch(
+            "insanely_fast_whisper_rocm.core.asr_backend.AutoTokenizer.from_pretrained",
+            return_value=MagicMock(),
+        ):
+            with patch(
+                "insanely_fast_whisper_rocm.core.asr_backend.AutoFeatureExtractor.from_pretrained",
+                return_value=MagicMock(),
+            ):
+                with patch(
+                    "insanely_fast_whisper_rocm.core.asr_backend.pipeline",
+                    return_value=MagicMock(model=mock_model),
+                ):
+                    backend._initialize_pipeline()
+
+    call_kwargs = mock_model_load.call_args[1]
+    assert call_kwargs["dtype"] == torch.bfloat16
+
+
 def test_initialize_pipeline_uses_sdpa_on_cuda(tmp_path: pathlib.Path) -> None:
     """Verify SDPA attention is used on CUDA devices."""
     config = HuggingFaceBackendConfig(
@@ -205,8 +247,57 @@ def test_initialize_pipeline_uses_sdpa_on_cuda(tmp_path: pathlib.Path) -> None:
     assert call_kwargs["attn_implementation"] == "sdpa"
 
 
-def test_initialize_pipeline_rocm_fallback_to_eager(tmp_path: pathlib.Path) -> None:
-    """Verify ROCm falls back to eager attention if SDPA fails."""
+def test_initialize_pipeline_rocm_defaults_to_eager(tmp_path: pathlib.Path) -> None:
+    """Verify ROCm uses eager attention by default (stable on gfx1103)."""
+    config = HuggingFaceBackendConfig(
+        model_name="openai/whisper-tiny",
+        device="cuda:0",
+        dtype="float16",
+        batch_size=4,
+        chunk_length=30,
+        progress_group_size=4,
+    )
+
+    with patch("torch.cuda.is_available", return_value=True):
+        backend = HuggingFaceBackend(config)
+
+    mock_model = MagicMock()
+    mock_model.generation_config = types.SimpleNamespace(no_timestamps_token_id=50363)
+    mock_model.config = types.SimpleNamespace(lang_to_id=None, task_to_id=None)
+
+    # Simulate ROCm with the default (empty) attn override.
+    with patch("torch.version.hip", "5.7", create=True):
+        with patch(
+            "insanely_fast_whisper_rocm.core.asr_backend.DEFAULT_ATTN_IMPLEMENTATION",
+            "",
+        ):
+            with patch(
+                "insanely_fast_whisper_rocm.core.asr_backend.AutoModelForSpeechSeq2Seq.from_pretrained",
+                return_value=mock_model,
+            ) as mock_model_load:
+                with patch(
+                    "insanely_fast_whisper_rocm.core.asr_backend.AutoTokenizer.from_pretrained",
+                    return_value=MagicMock(),
+                ):
+                    with patch(
+                        "insanely_fast_whisper_rocm.core.asr_backend.AutoFeatureExtractor.from_pretrained",
+                        return_value=MagicMock(),
+                    ):
+                        with patch(
+                            "insanely_fast_whisper_rocm.core.asr_backend.pipeline",
+                            return_value=MagicMock(model=mock_model),
+                        ):
+                            backend._initialize_pipeline()
+
+    # Single load with eager attention; no sdpa attempt on ROCm by default.
+    assert mock_model_load.call_count == 1
+    assert mock_model_load.call_args[1]["attn_implementation"] == "eager"
+
+
+def test_initialize_pipeline_rocm_sdpa_override_falls_back_to_eager(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verify explicit sdpa on ROCm still falls back to eager if the load fails."""
     config = HuggingFaceBackendConfig(
         model_name="openai/whisper-tiny",
         device="cuda:0",
@@ -226,7 +317,7 @@ def test_initialize_pipeline_rocm_fallback_to_eager(tmp_path: pathlib.Path) -> N
     call_count = 0
 
     def from_pretrained_side_effect(*args: object, **kwargs: object) -> object:
-        """Simulate SDPA failure on ROCm, then succeed with eager.
+        """Simulate SDPA load failure on ROCm, then succeed with eager.
 
         Args:
             *args: Positional arguments.
@@ -246,25 +337,29 @@ def test_initialize_pipeline_rocm_fallback_to_eager(tmp_path: pathlib.Path) -> N
         # Second call with eager succeeds
         return mock_model
 
-    # Simulate ROCm
+    # Simulate ROCm with an explicit sdpa override.
     with patch("torch.version.hip", "5.7", create=True):
         with patch(
-            "insanely_fast_whisper_rocm.core.asr_backend.AutoModelForSpeechSeq2Seq.from_pretrained",
-            side_effect=from_pretrained_side_effect,
-        ) as mock_model_load:
+            "insanely_fast_whisper_rocm.core.asr_backend.DEFAULT_ATTN_IMPLEMENTATION",
+            "sdpa",
+        ):
             with patch(
-                "insanely_fast_whisper_rocm.core.asr_backend.AutoTokenizer.from_pretrained",
-                return_value=MagicMock(),
-            ):
+                "insanely_fast_whisper_rocm.core.asr_backend.AutoModelForSpeechSeq2Seq.from_pretrained",
+                side_effect=from_pretrained_side_effect,
+            ) as mock_model_load:
                 with patch(
-                    "insanely_fast_whisper_rocm.core.asr_backend.AutoFeatureExtractor.from_pretrained",
+                    "insanely_fast_whisper_rocm.core.asr_backend.AutoTokenizer.from_pretrained",
                     return_value=MagicMock(),
                 ):
                     with patch(
-                        "insanely_fast_whisper_rocm.core.asr_backend.pipeline",
-                        return_value=MagicMock(model=mock_model),
+                        "insanely_fast_whisper_rocm.core.asr_backend.AutoFeatureExtractor.from_pretrained",
+                        return_value=MagicMock(),
                     ):
-                        backend._initialize_pipeline()
+                        with patch(
+                            "insanely_fast_whisper_rocm.core.asr_backend.pipeline",
+                            return_value=MagicMock(model=mock_model),
+                        ):
+                            backend._initialize_pipeline()
 
     # Should have been called twice: once with SDPA, once with eager
     assert mock_model_load.call_count == 2
