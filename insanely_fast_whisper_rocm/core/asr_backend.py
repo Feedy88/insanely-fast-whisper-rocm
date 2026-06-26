@@ -511,6 +511,10 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
                 cancellation_token.raise_if_cancelled()
             try:
                 outputs = self.asr_pipe(str(audio_file_path), **pipeline_kwargs)
+                # Flush pending HIP kernels so the next request starts on a clean
+                # GPU state. On ROCm/iGPU, skipping this can corrupt the context.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             except RuntimeError as e:
                 oom_error = classify_oom_error(e)
                 if oom_error:
@@ -522,6 +526,19 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
                             "chunk_length": self.config.chunk_length,
                         },
                     ) from e
+                if "hip error" in str(e).lower():
+                    logger.warning(
+                        "HIP error during inference; resetting pipeline so next "
+                        "request reinitialises on a clean GPU context: %s",
+                        str(e),
+                    )
+                    self.asr_pipe = None
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
                 raise
         except RuntimeError as e:
             # Check if this is the specific tensor size mismatch error in
