@@ -142,3 +142,31 @@ def test_route_dependencies() -> None:
     # Just check that these can be imported without errors
     assert callable(get_asr_pipeline)
     assert callable(get_file_handler)
+
+
+def test_gpu_context_lost_response_schedules_restart_when_enabled() -> None:
+    """The 503 helper attaches a process-restart background task when enabled."""
+    from unittest.mock import patch
+
+    from insanely_fast_whisper_rocm.api import routes
+    from insanely_fast_whisper_rocm.core.asr_backend import exit_due_to_gpu_context_loss
+
+    with patch.object(routes, "EXIT_ON_GPU_ERROR", True):
+        response = routes._gpu_context_lost_response()
+
+    assert response.status_code == 503
+    assert response.background is not None
+    assert response.background.func is exit_due_to_gpu_context_loss
+
+
+def test_gpu_context_lost_response_no_restart_when_disabled() -> None:
+    """With restarts disabled the 503 helper omits the background task."""
+    from unittest.mock import patch
+
+    from insanely_fast_whisper_rocm.api import routes
+
+    with patch.object(routes, "EXIT_ON_GPU_ERROR", False):
+        response = routes._gpu_context_lost_response()
+
+    assert response.status_code == 503
+    assert response.background is None

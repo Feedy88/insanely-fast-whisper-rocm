@@ -22,7 +22,11 @@ from wyoming.event import Event
 from wyoming.info import Describe, Info
 from wyoming.server import AsyncEventHandler
 
-from insanely_fast_whisper_rocm.core.asr_backend import HuggingFaceBackendConfig
+from insanely_fast_whisper_rocm.core.asr_backend import (
+    GPU_LOST_EXIT_CODE,
+    HuggingFaceBackendConfig,
+    exit_due_to_gpu_context_loss,
+)
 from insanely_fast_whisper_rocm.core.errors import GpuContextLostError
 from insanely_fast_whisper_rocm.core.orchestrator import TranscriptionOrchestrator
 from insanely_fast_whisper_rocm.utils.constants import (
@@ -43,8 +47,9 @@ _TARGET_WIDTH = 2  # 16-bit
 _TARGET_CHANNELS = 1  # mono
 
 # Non-zero exit code used when bailing out on an unrecoverable GPU error, so the
-# service supervisor treats it as a failure and restarts the process.
-_GPU_LOST_EXIT_CODE = 75
+# service supervisor treats it as a failure and restarts the process. Shared
+# with the FastAPI service via the asr_backend module so they stay in sync.
+_GPU_LOST_EXIT_CODE = GPU_LOST_EXIT_CODE
 
 
 class WyomingEventHandler(AsyncEventHandler):
@@ -149,11 +154,11 @@ class WyomingEventHandler(AsyncEventHandler):
             )
             return
 
-        # os._exit bypasses asyncio/atexit teardown on purpose: the context is
-        # dead and we want an immediate, guaranteed process exit for the
-        # supervisor to restart. The temp WAV is already cleaned up in the
-        # worker's finally block before this error propagated.
-        os._exit(_GPU_LOST_EXIT_CODE)
+        # Shared recovery: free caches and force-exit so the supervisor restarts
+        # us with a clean context. The temp WAV is already cleaned up in the
+        # worker's finally block before this error propagated. This call does
+        # not return.
+        exit_due_to_gpu_context_loss(_GPU_LOST_EXIT_CODE)
 
     def _transcribe_buffered_audio(self) -> str:
         """Write buffered PCM to a temp WAV, run Whisper, return text.

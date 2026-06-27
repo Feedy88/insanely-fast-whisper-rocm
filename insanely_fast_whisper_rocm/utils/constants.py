@@ -374,12 +374,18 @@ WYOMING_HOST = os.getenv("WYOMING_HOST", "0.0.0.0")
 WYOMING_PORT = int(os.getenv("WYOMING_PORT", "10300"))
 WYOMING_LANGUAGE = os.getenv("WYOMING_LANGUAGE", "de")
 
-# When the GPU/HIP context is irrecoverably lost mid-inference, exit the Wyoming
-# process so a supervisor (systemd Restart=on-failure / Docker restart policy)
-# brings it back up with a clean context. Disable only if you run the server
-# without a supervisor and prefer it to stay up returning empty transcripts.
+# When the GPU/HIP context is irrecoverably lost mid-inference, exit the process
+# so a supervisor (systemd Restart=on-failure / Docker restart policy) brings it
+# back up with a clean context. This shared toggle applies to BOTH the Wyoming
+# server and the FastAPI service, so their recovery behaviour stays in sync.
+# Disable only if you run without a supervisor and prefer the process to stay up
+# (Wyoming then returns empty transcripts; the API returns HTTP 503).
+EXIT_ON_GPU_ERROR = os.getenv("WHISPER_EXIT_ON_GPU_ERROR", "true").lower() == "true"
+
+# Backwards-compatible, Wyoming-specific override. Defaults to the shared toggle
+# above so existing WYOMING_EXIT_ON_GPU_ERROR deployments keep working.
 WYOMING_EXIT_ON_GPU_ERROR = (
-    os.getenv("WYOMING_EXIT_ON_GPU_ERROR", "true").lower() == "true"
+    os.getenv("WYOMING_EXIT_ON_GPU_ERROR", str(EXIT_ON_GPU_ERROR)).lower() == "true"
 )
 
 # Logging configuration

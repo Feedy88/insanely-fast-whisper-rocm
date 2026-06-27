@@ -8,13 +8,16 @@ import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 from insanely_fast_whisper_rocm.api.dependencies import (
     get_asr_pipeline,
     get_file_handler,
 )
 from insanely_fast_whisper_rocm.api.responses import ResponseFormatter
-from insanely_fast_whisper_rocm.core.errors import OutOfMemoryError
+from insanely_fast_whisper_rocm.core.asr_backend import exit_due_to_gpu_context_loss
+from insanely_fast_whisper_rocm.core.errors import GpuContextLostError, OutOfMemoryError
 from insanely_fast_whisper_rocm.core.integrations.stable_ts import stabilize_timestamps
 from insanely_fast_whisper_rocm.core.orchestrator import create_orchestrator
 from insanely_fast_whisper_rocm.core.pipeline import WhisperPipeline
@@ -28,10 +31,55 @@ from insanely_fast_whisper_rocm.utils import (
     SUPPORTED_RESPONSE_FORMATS,
     FileHandler,
 )
+from insanely_fast_whisper_rocm.utils.constants import EXIT_ON_GPU_ERROR
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Message returned to the client when the GPU/HIP context is lost and the
+# service is restarting (or staying up, if restarts are disabled).
+_GPU_CONTEXT_LOST_DETAIL = (
+    "GPU context lost during inference; the service is restarting with a clean "
+    "GPU context. Please retry the request shortly."
+)
+
+
+def _gpu_context_lost_response() -> JSONResponse:
+    """Build the HTTP 503 response for an unrecoverable GPU context loss.
+
+    A "HIP error: unspecified launch failure" poisons the GPU context for the
+    whole process, so every subsequent request would otherwise fail with a 500.
+    The pipeline and allocator caches were already dropped in
+    ``asr_backend.process_audio``; here we return a 503 to the in-flight client
+    and, unless restarts are disabled, attach a background task that force-exits
+    the process *after* the response is flushed so systemd
+    (``Restart=on-failure``) brings the service back with a clean context.
+
+    This mirrors the Wyoming server's recovery so both services behave the same.
+
+    Returns:
+        A 503 JSON response, with a process-restart background task when
+        ``WHISPER_EXIT_ON_GPU_ERROR`` is enabled.
+    """
+    if not EXIT_ON_GPU_ERROR:
+        logger.warning(
+            "WHISPER_EXIT_ON_GPU_ERROR is disabled; staying up, but further "
+            "requests will keep failing until the process is restarted."
+        )
+        return JSONResponse(
+            status_code=503, content={"detail": _GPU_CONTEXT_LOST_DETAIL}
+        )
+
+    logger.critical(
+        "GPU context lost; returning 503 and scheduling a process restart for a "
+        "clean GPU context."
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": _GPU_CONTEXT_LOST_DETAIL},
+        background=BackgroundTask(exit_due_to_gpu_context_loss),
+    )
 
 
 @router.post(
@@ -145,6 +193,11 @@ async def create_transcription(
                 status_code=507,
                 detail=f"Insufficient GPU memory for transcription: {str(oom)}",
             ) from oom
+        except GpuContextLostError as gpu_err:
+            logger.critical(
+                "GPU context lost during transcription: %s", gpu_err, exc_info=True
+            )
+            return _gpu_context_lost_response()
         except Exception as e:
             if isinstance(e, HTTPException):
                 raise
@@ -272,6 +325,11 @@ async def create_translation(
                 status_code=507,
                 detail=f"Insufficient GPU memory for translation: {str(oom)}",
             ) from oom
+        except GpuContextLostError as gpu_err:
+            logger.critical(
+                "GPU context lost during translation: %s", gpu_err, exc_info=True
+            )
+            return _gpu_context_lost_response()
         except Exception as e:
             if isinstance(e, HTTPException):
                 raise

@@ -35,7 +35,7 @@ def _make_handler() -> WyomingEventHandler:
 
 
 def test_handle_gpu_context_lost_exits_when_enabled() -> None:
-    """Empty transcript is sent and the process exits with the failure code."""
+    """Empty transcript is sent and the shared restart helper is invoked."""
     handler = _make_handler()
 
     with patch(
@@ -43,7 +43,7 @@ def test_handle_gpu_context_lost_exits_when_enabled() -> None:
         True,
     ):
         with patch(
-            "insanely_fast_whisper_rocm.wyoming.handler.os._exit"
+            "insanely_fast_whisper_rocm.wyoming.handler.exit_due_to_gpu_context_loss"
         ) as mock_exit:
             asyncio.run(handler._handle_gpu_context_lost())
 
@@ -55,7 +55,7 @@ def test_handle_gpu_context_lost_exits_when_enabled() -> None:
 
 
 def test_handle_gpu_context_lost_stays_up_when_disabled() -> None:
-    """With the toggle off, the process keeps running (no exit)."""
+    """With the toggle off, the process keeps running (no restart)."""
     handler = _make_handler()
 
     with patch(
@@ -63,7 +63,7 @@ def test_handle_gpu_context_lost_stays_up_when_disabled() -> None:
         False,
     ):
         with patch(
-            "insanely_fast_whisper_rocm.wyoming.handler.os._exit"
+            "insanely_fast_whisper_rocm.wyoming.handler.exit_due_to_gpu_context_loss"
         ) as mock_exit:
             asyncio.run(handler._handle_gpu_context_lost())
 

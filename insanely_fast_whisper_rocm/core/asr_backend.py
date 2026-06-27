@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+import sys
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -48,6 +50,69 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+# ---------------------------------------------------------------------------
+# Shared GPU-context-loss recovery
+#
+# A "HIP error: unspecified launch failure" on ROCm poisons the device context
+# for the *entire process*; no in-process recovery works (even
+# torch.cuda.synchronize() keeps failing). The only fix is to restart the
+# process so it comes back with a clean context. The helpers below are the
+# single source of truth for that recovery so every supervised entry point
+# (the Wyoming server and the FastAPI service) behaves identically and the two
+# cannot drift apart.
+# ---------------------------------------------------------------------------
+
+# Exit code used when bailing out on an unrecoverable GPU/HIP context loss, so a
+# supervisor (systemd ``Restart=on-failure``, Docker restart policy) treats it
+# as a failure and restarts the process. 75 == ``EX_TEMPFAIL`` (sysexits.h).
+GPU_LOST_EXIT_CODE = 75
+
+
+def free_gpu_caches() -> None:
+    """Best-effort release of accelerator allocator caches.
+
+    Safe to call on any backend; unavailable devices are ignored. Used both as
+    the in-process cleanup step immediately after a HIP error and again just
+    before a process restart.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - defensive cleanup
+        pass
+    try:
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - defensive cleanup
+        pass
+
+
+def exit_due_to_gpu_context_loss(exit_code: int = GPU_LOST_EXIT_CODE) -> None:
+    """Free GPU caches and force-terminate the process for a supervised restart.
+
+    Shared by the Wyoming server and the FastAPI service so their GPU-loss
+    recovery cannot diverge. ``os._exit`` is used on purpose: the HIP context is
+    dead process-wide, so we need an immediate, guaranteed exit that
+    asyncio/uvicorn cannot swallow (a plain ``sys.exit``/``SystemExit`` is
+    caught by the event loop and the worker keeps running). A supervisor then
+    restarts the service with a clean GPU context.
+
+    This never returns, so callers must first send any protocol-appropriate
+    response to the in-flight client (an empty Wyoming transcript, an HTTP 503).
+
+    Args:
+        exit_code: Non-zero process exit code reported to the supervisor.
+    """
+    free_gpu_caches()
+    logger.critical(
+        "Exiting (code %d) after unrecoverable GPU context loss so the service "
+        "restarts with a clean GPU context.",
+        exit_code,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
 
 
 @dataclass
@@ -555,9 +620,11 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
                 if "hip error" in msg or "unspecified launch failure" in msg:
                     # The HIP context is poisoned process-wide; it cannot be
                     # recovered in place (empty_cache/synchronize keep failing).
-                    # Drop the pipeline and surface a typed error so a supervised
-                    # caller can restart the process with a clean context.
+                    # Drop the pipeline and free the allocator caches, then
+                    # surface a typed error so a supervised caller can restart
+                    # the process with a clean context.
                     self.asr_pipe = None
+                    free_gpu_caches()
                     logger.critical(
                         "Unrecoverable GPU error during inference; the HIP context "
                         "is lost process-wide: %s",
@@ -688,17 +755,8 @@ class HuggingFaceBackend(ASRBackend):  # pylint: disable=too-few-public-methods
                 # Explicitly drop references to model/tokenizer/feature_extractor
                 self.asr_pipe = None
         finally:
-            # Best-effort device cache cleanup
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:  # pragma: no cover - defensive cleanup
-                pass
-            try:
-                if hasattr(torch, "mps") and torch.backends.mps.is_available():
-                    torch.mps.empty_cache()  # type: ignore[attr-defined]
-            except Exception:  # pragma: no cover - defensive cleanup
-                pass
+            # Best-effort device cache cleanup (shared with HIP-error recovery)
+            free_gpu_caches()
             # Force immediate garbage collection to reclaim memory
             gc.collect()
 

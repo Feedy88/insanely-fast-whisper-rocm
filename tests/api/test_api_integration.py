@@ -467,3 +467,84 @@ class TestBackwardsCompatibility:
         assert backend_config.model_name == constants.DEFAULT_MODEL
         assert backend_config.device == constants.DEFAULT_DEVICE
         assert backend_config.batch_size == constants.DEFAULT_BATCH_SIZE
+
+
+class TestGpuContextLostRecovery:
+    """Verify the API mirrors the Wyoming GPU-context-loss recovery.
+
+    On an unrecoverable HIP error the orchestrator raises GpuContextLostError.
+    The endpoint must answer the in-flight client with HTTP 503 (not 500) and
+    schedule a process restart so systemd brings the service back with a clean
+    GPU context, instead of leaving a poisoned context that fails every
+    subsequent request.
+    """
+
+    def _override_pipeline(self, client: TestClient) -> None:
+        """Inject a lightweight mock ASR pipeline via dependency override."""
+        from insanely_fast_whisper_rocm.api.dependencies import get_asr_pipeline
+
+        mock_pipeline = Mock()
+        mock_pipeline.asr_backend.config.model_name = "test-model"
+        client.app.dependency_overrides[get_asr_pipeline] = lambda: mock_pipeline
+
+    @patch("insanely_fast_whisper_rocm.api.routes.exit_due_to_gpu_context_loss")
+    @patch("insanely_fast_whisper_rocm.api.routes.EXIT_ON_GPU_ERROR", True)
+    @patch("insanely_fast_whisper_rocm.api.routes.create_orchestrator")
+    def test_transcription_gpu_loss_returns_503_and_restarts(
+        self,
+        mock_create_orchestrator: Mock,
+        mock_exit: Mock,
+        client: TestClient,
+        mock_audio_file: tuple[str, BytesIO, str],
+    ) -> None:
+        """A HIP context loss yields 503 and triggers the restart background task."""
+        from insanely_fast_whisper_rocm.core.errors import GpuContextLostError
+
+        mock_orch = Mock()
+        mock_orch.run_transcription.side_effect = GpuContextLostError(
+            "GPU context lost during inference"
+        )
+        mock_create_orchestrator.return_value = mock_orch
+        self._override_pipeline(client)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": mock_audio_file},
+            data={"language": "en", "task": "transcribe"},
+        )
+
+        assert response.status_code == 503
+        assert "restarting" in response.json()["detail"].lower()
+        # TestClient runs the background task after the response; the shared exit
+        # helper (patched here so it does not actually kill the test process)
+        # must have been invoked to restart the service.
+        mock_exit.assert_called_once()
+
+    @patch("insanely_fast_whisper_rocm.api.routes.exit_due_to_gpu_context_loss")
+    @patch("insanely_fast_whisper_rocm.api.routes.EXIT_ON_GPU_ERROR", False)
+    @patch("insanely_fast_whisper_rocm.api.routes.create_orchestrator")
+    def test_translation_gpu_loss_stays_up_when_disabled(
+        self,
+        mock_create_orchestrator: Mock,
+        mock_exit: Mock,
+        client: TestClient,
+        mock_audio_file: tuple[str, BytesIO, str],
+    ) -> None:
+        """With restarts disabled the API returns 503 but does not exit."""
+        from insanely_fast_whisper_rocm.core.errors import GpuContextLostError
+
+        mock_orch = Mock()
+        mock_orch.run_transcription.side_effect = GpuContextLostError(
+            "GPU context lost during inference"
+        )
+        mock_create_orchestrator.return_value = mock_orch
+        self._override_pipeline(client)
+
+        response = client.post(
+            "/v1/audio/translations",
+            files={"file": mock_audio_file},
+            data={"language": "de"},
+        )
+
+        assert response.status_code == 503
+        mock_exit.assert_not_called()
